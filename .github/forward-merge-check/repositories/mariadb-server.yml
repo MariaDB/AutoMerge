@@ -2,15 +2,14 @@ name: MariaDB Server
 repository: MariaDB/server
 
 # Ordered from oldest/stablest to newest.
-base_branch: "10.6"
+base_branch: "10.11"
 
 branches:
-  - "10.6"
   - "10.11"
   - "11.4"
   - "11.8"
   - "12.3"
-  - "13.0"
+  - "13.1"
   - "main"
 
 notifications:
