@@ -49,13 +49,23 @@ def print_result(result: MergeResult) -> None:
         for path in result.conflicted_files:
             print(f"  - {path}")
 
-    if result.first_conflicting_commit:
-        c = result.first_conflicting_commit
+    if result.conflict_origins:
         print()
-        print("First likely source-side commit that fails this target merge:")
-        print(f"  - {c.sha}")
-        print(f"    Author:  {c.author}")
-        print(f"    Subject: {c.subject}")
+        print("Source-side commits where the conflicted files start to conflict:")
+        for origin in result.conflict_origins:
+            if origin.from_test_merge:
+                print("  - unmerged changes from earlier branches")
+            elif origin.commit:
+                c = origin.commit
+                print(f"  - {c.sha}")
+                print(f"    Author:  {c.author}")
+                print(f"    Subject: {c.subject}")
+            else:
+                print("  - not identified")
+            for c in origin.via_commits:
+                print(f"    Via:     {c.sha[:12]} {c.subject} ({c.author})")
+            for path in origin.files:
+                print(f"    File:    {path}")
 
     if result.candidate_commits:
         print()

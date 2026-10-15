@@ -3,6 +3,7 @@ from typing import Optional
 
 from .models import NotificationReason
 
+MAX_VIA_COMMITS = 5
 
 def github_repository_label() -> str:
     return (
@@ -139,22 +140,51 @@ def format_notification(state: dict, reasons: list[NotificationReason], style: s
     for index, blocked in blocked_results:
         lines.append("")
         lines.append(f"{index}. *Edge:* `{blocked['source_label']}` -> `{blocked['target']}`")
-        commit = blocked.get("first_conflicting_commit")
-        if commit:
-            short_sha = commit["sha"][:12]
-            commit_label = format_link(github_commit_url(commit["sha"]), short_sha, style)
-            lines.append(
-                "*First likely source-side commit:* "
-                f"{commit_label} - {commit['subject']}"
-            )
-            lines.append(f"*Author:* {commit['author']}")
-        else:
-            lines.append("*First likely source-side commit:* not identified")
 
-        if blocked["conflicted_files"]:
-            lines.append(f"*Conflicted files ({len(blocked['conflicted_files'])}):*")
-            lines.append("```")
-            lines.extend(f"- {path}" for path in blocked["conflicted_files"])
-            lines.append("```")
+        if not blocked["conflicted_files"]:
+            continue
+
+        lines.append(f"*Conflicted files ({len(blocked['conflicted_files'])}):*")
+        origins = blocked.get("conflict_origins") or []
+        if not origins:
+            lines.extend(format_file_block(blocked["conflicted_files"]))
+        for origin in origins:
+            lines.extend(format_conflict_origin(origin, style))
 
     return "\n".join(lines)
+
+
+def format_commit(commit: dict, style: str) -> str:
+    label = format_link(github_commit_url(commit["sha"]), commit["sha"][:12], style)
+    return f"{label} - {commit['subject']}"
+
+
+def format_file_block(files: list[str]) -> list[str]:
+    return ["```", *(f"- {path}" for path in files), "```"]
+
+
+def format_conflict_origin(origin: dict, style: str) -> list[str]:
+    commit = origin.get("commit")
+    via_commits = origin.get("via_commits") or []
+
+    if origin.get("from_test_merge"):
+        lines = ["*Started conflicting at:* unmerged changes from earlier branches"]
+    elif commit:
+        lines = [f"*Started conflicting at:* {format_commit(commit, style)}"]
+        # A merge that brought the change in did not author it.
+        author_label = "Merged by" if via_commits else "Author"
+        lines.append(f"*{author_label}:* {commit['author']}")
+    else:
+        lines = ["*Started conflicting at:* not identified"]
+
+    if via_commits:
+        lines.append("*Changes brought in that touch these files:*")
+        lines.extend(
+            f"- {format_commit(via, style)} ({via['author']})"
+            for via in via_commits[:MAX_VIA_COMMITS]
+        )
+        if len(via_commits) > MAX_VIA_COMMITS:
+            lines.append(f"- and {len(via_commits) - MAX_VIA_COMMITS} more")
+
+    lines.extend(format_file_block(origin["files"]))
+    return lines

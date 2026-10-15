@@ -91,14 +91,28 @@ failed synthetic 10.11 -> 11.4
 When a merge fails, the script reports:
 
 - blocked edge
-- conflicted files
-- first likely source-side commit that fails this target merge
+- conflicted files, grouped by the source-side commit where each file starts
+  to conflict
 - candidate source-side and target-side commits that touched conflicted files
+  (console output only)
+
+To find where a file starts to conflict, the checker walks the source's own
+first-parent line, newest first, and merges each commit into the target in
+memory with `git merge-tree --write-tree` (git 2.38 or newer). A file's origin
+is the commit where it last went from merging cleanly to conflicting.
+
+Merge commits such as "Merge 10.11 into 11.4" are single steps in that walk.
+The 10.11 commits they brought in are not merged into 11.8 on their own, because
+that would use a different merge base and skip the merge that may already have
+adapted them. When the origin is a merge, the report lists the commits it
+brought in that touch the files, and names the merge author as "Merged by"
+rather than "Author". When the origin is the checker's own test merge of earlier
+branches, the report says "unmerged changes from earlier branches" and lists
+the commits from those branches that touch the files.
 
 Candidate commits come from `git log --left-right --merge` while the repository
-is still in the conflicted merge state. The "first likely" commit is an
-approximation. Git conflicts come from the interaction between both branches, so
-this is a debugging hint, not proof.
+is still in the conflicted merge state. They show who touched a conflicted file,
+not whose change conflicts.
 
 ## Repository Model
 
