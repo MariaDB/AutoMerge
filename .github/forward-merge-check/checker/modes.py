@@ -7,11 +7,12 @@ from .models import MergeResult
 from .output import print_result
 
 
-def next_source_after_result(repo: Path, result: MergeResult) -> tuple[str, str]:
+def next_source_after_result(repo: Path, result: MergeResult) -> tuple[str, str, bool]:
+    """Return the next source label, ref and whether that ref is a local test merge."""
     if result.status == "merge_ok":
-        return f"test merge through {result.target}", result.source_ref
+        return f"test merge through {result.target}", result.source_ref, True
 
-    return result.target, require_branch_ref(repo, result.target)
+    return result.target, require_branch_ref(repo, result.target), False
 
 
 def first_downstream_broken_target_index(
@@ -73,16 +74,19 @@ def run_pr_mode(
 
     source_label = "PR head"
     source_ref = pr_ref
+    source_is_test_merge = False
 
     for target in targets:
-        result = check_merge(repo, source_label, source_ref, target, scratch_root)
+        result = check_merge(
+            repo, source_label, source_ref, target, scratch_root, source_is_test_merge
+        )
         results.append(result)
         print_result(result)
 
         if result.status == "conflict":
             break
 
-        source_label, source_ref = next_source_after_result(repo, result)
+        source_label, source_ref, source_is_test_merge = next_source_after_result(repo, result)
 
     return results
 
@@ -91,12 +95,15 @@ def run_chain_health_mode(repo: Path, branches: list[str], base_branch: str, scr
     results: list[MergeResult] = []
     source_label = base_branch
     source_ref = require_branch_ref(repo, base_branch)
+    source_is_test_merge = False
 
     for target in branch_targets_after(branches, base_branch):
-        result = check_merge(repo, source_label, source_ref, target, scratch_root)
+        result = check_merge(
+            repo, source_label, source_ref, target, scratch_root, source_is_test_merge
+        )
         results.append(result)
         print_result(result)
 
-        source_label, source_ref = next_source_after_result(repo, result)
+        source_label, source_ref, source_is_test_merge = next_source_after_result(repo, result)
 
     return results

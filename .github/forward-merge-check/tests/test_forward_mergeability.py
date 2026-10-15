@@ -81,10 +81,16 @@ class GitRepo:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
 
-    def commit(self, message: str) -> str:
+    def commit(self, message: str, author: str | None = None) -> str:
         git(self.path, "add", ".")
-        git(self.path, "commit", "-m", message)
+        args = ["commit", "-m", message]
+        if author:
+            args.append(f"--author={author}")
+        git(self.path, *args)
         return git(self.path, "rev-parse", "HEAD")
+
+    def start_merge(self, branch: str) -> None:
+        git(self.path, "merge", "--no-ff", "--no-commit", branch)
 
     def checkout(self, branch: str, start: str | None = None) -> None:
         args = ["checkout", "-B", branch]
@@ -139,6 +145,74 @@ def make_conflicting_chain(root: Path) -> tuple[GitRepo, str]:
     repo.checkout("main", "next")
 
     for branch in ["old", "next", "main"]:
+        repo.expose_origin_ref(branch)
+
+    return repo, old_sha
+
+
+def make_merged_from_older_branch_chain(root: Path) -> tuple[GitRepo, dict[str, str]]:
+    """
+    Shaped like 10.11 -> 11.4 -> 11.8, with 10.11 already merged into 11.4:
+
+    - old adapted.txt: conflicts with next on its own, but the merge into mid
+      dropped it, so it is not a real mid -> next conflict.
+    - old rpl.txt: reaches next only through the merge into mid and conflicts.
+    - mid harmless: touches shared.txt far from next's change.
+    - mid conflict: touches the same shared.txt line as next.
+    """
+    repo = GitRepo(root / "repo")
+    repo.write("shared.txt", "1\n2\n3\n4\n5\n")
+    repo.write("adapted.txt", "base\n")
+    repo.write("rpl.txt", "base\n")
+    repo.commit("base")
+
+    repo.checkout("next", "master")
+    repo.write("shared.txt", "next\n2\n3\n4\n5\n")
+    repo.write("adapted.txt", "next\n")
+    repo.write("rpl.txt", "next\n")
+    repo.commit("next changes")
+
+    shas = {}
+    repo.checkout("old", "master")
+    repo.write("adapted.txt", "old\n")
+    shas["old_adapted"] = repo.commit("old adapted fix", "Adapted Author <adapted@example.invalid>")
+    repo.write("rpl.txt", "old\n")
+    shas["old_rpl"] = repo.commit("old rpl fix", "Rpl Author <rpl@example.invalid>")
+
+    repo.checkout("mid", "master")
+    repo.write("shared.txt", "1\n2\n3\n4\nharmless\n")
+    shas["mid_harmless"] = repo.commit("mid harmless", "Harmless Author <harmless@example.invalid>")
+    repo.write("shared.txt", "mid\n2\n3\n4\nharmless\n")
+    shas["mid_conflict"] = repo.commit("mid conflict", "Conflict Author <conflict@example.invalid>")
+    repo.start_merge("old")
+    repo.write("adapted.txt", "base\n")
+    shas["merge"] = repo.commit("Merge old into mid", "Merger <merger@example.invalid>")
+
+    for branch in ["old", "mid", "next"]:
+        repo.expose_origin_ref(branch)
+
+    return repo, shas
+
+
+def make_test_merge_conflict_chain(root: Path) -> tuple[GitRepo, str]:
+    repo = GitRepo(root / "repo")
+    repo.write("file.txt", "base\n")
+    repo.write("mid.txt", "base\n")
+    repo.commit("base")
+
+    repo.checkout("old", "master")
+    repo.write("file.txt", "old\n")
+    old_sha = repo.commit("old changes line", "Old Author <old@example.invalid>")
+
+    repo.checkout("mid", "master")
+    repo.write("mid.txt", "mid\n")
+    repo.commit("mid changes other file")
+
+    repo.checkout("next", "master")
+    repo.write("file.txt", "next\n")
+    repo.commit("next changes line")
+
+    for branch in ["old", "mid", "next"]:
         repo.expose_origin_ref(branch)
 
     return repo, old_sha
@@ -276,8 +350,12 @@ class MergeCheckTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertEqual(results[0].status, "conflict")
         self.assertEqual(results[0].conflicted_files, ["file.txt"])
-        self.assertIsNotNone(results[0].first_conflicting_commit)
-        self.assertEqual(results[0].first_conflicting_commit.sha, old_sha)
+        self.assertEqual(len(results[0].conflict_origins), 1)
+        origin = results[0].conflict_origins[0]
+        self.assertEqual(origin.files, ["file.txt"])
+        self.assertEqual(origin.commit.sha, old_sha)
+        self.assertEqual(origin.via_commits, [])
+        self.assertFalse(origin.from_test_merge)
         candidate_subjects = {
             (commit.side, commit.subject) for commit in results[0].candidate_commits
         }
@@ -286,6 +364,76 @@ class MergeCheckTests(unittest.TestCase):
         self.assertEqual(results[1].source_label, "next")
         self.assertEqual(results[1].target, "main")
         self.assertEqual(results[1].status, "nothing_to_merge")
+
+    def test_conflict_origins_follow_first_parent_line_through_merges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, shas = make_merged_from_older_branch_chain(Path(tmp))
+            scratch = Path(tmp) / "scratch"
+            scratch.mkdir()
+
+            # Merged into next on its own, the adapted old commit does conflict.
+            adapted_alone = git_ops.merge_tree_conflicted_files(
+                repo.path, "next", shas["old_adapted"]
+            )
+            results = quietly(
+                check.run_chain_health_mode,
+                repo.path,
+                ["old", "mid", "next"],
+                "old",
+                scratch,
+            )
+
+        self.assertEqual(adapted_alone, ["adapted.txt"])
+        self.assertEqual(
+            [result.status for result in results],
+            ["nothing_to_merge", "conflict"],
+        )
+        result = results[1]
+        self.assertEqual(result.conflicted_files, ["rpl.txt", "shared.txt"])
+
+        origins = [
+            (
+                origin.files,
+                origin.commit.sha,
+                [commit.sha for commit in origin.via_commits],
+            )
+            for origin in result.conflict_origins
+        ]
+        self.assertEqual(
+            origins,
+            [
+                (["shared.txt"], shas["mid_conflict"], []),
+                (["rpl.txt"], shas["merge"], [shas["old_rpl"]]),
+            ],
+        )
+
+    def test_conflict_origin_in_test_merge_lists_earlier_branch_commits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, old_sha = make_test_merge_conflict_chain(Path(tmp))
+            scratch = Path(tmp) / "scratch"
+            scratch.mkdir()
+
+            results = quietly(
+                check.run_chain_health_mode,
+                repo.path,
+                ["old", "mid", "next"],
+                "old",
+                scratch,
+            )
+            state = check.current_state(repo.path, ["old", "mid", "next"], "old", results)
+
+        self.assertEqual([result.status for result in results], ["merge_ok", "conflict"])
+        self.assertEqual(results[1].source_label, "test merge through mid")
+        self.assertEqual(len(results[1].conflict_origins), 1)
+        origin = results[1].conflict_origins[0]
+        self.assertEqual(origin.files, ["file.txt"])
+        self.assertTrue(origin.from_test_merge)
+        self.assertIsNone(origin.commit)
+        self.assertEqual([commit.sha for commit in origin.via_commits], [old_sha])
+        self.assertNotIn(
+            results[0].source_ref,
+            json.dumps(state["results"][1]["conflict_origins"]),
+        )
 
     def test_pr_mode_stops_before_preexisting_downstream_break(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -421,11 +569,18 @@ class StateTests(unittest.TestCase):
                         "status": "conflict",
                         "message": "blocked",
                         "conflicted_files": ["file.txt"],
-                        "first_conflicting_commit": {
-                            "sha": "abc",
-                            "author": "Tester <tester@example.invalid>",
-                            "subject": "break it",
-                        },
+                        "conflict_origins": [
+                            {
+                                "files": ["file.txt"],
+                                "commit": {
+                                    "sha": "abc",
+                                    "author": "Tester <tester@example.invalid>",
+                                    "subject": "break it",
+                                },
+                                "via_commits": [],
+                                "from_test_merge": False,
+                            }
+                        ],
                         "candidate_commits": [
                             {
                                 "side": "source",
@@ -447,12 +602,38 @@ class StateTests(unittest.TestCase):
                         "target": "main",
                         "status": "conflict",
                         "message": "blocked again",
-                        "conflicted_files": ["other.txt", "src/deep/path.cc"],
-                        "first_conflicting_commit": {
-                            "sha": "def456789012",
-                            "author": "Second Tester <second@example.invalid>",
-                            "subject": "break it again",
-                        },
+                        "conflicted_files": ["other.txt", "src/deep/path.cc", "unmerged.txt"],
+                        "conflict_origins": [
+                            {
+                                "files": ["other.txt", "src/deep/path.cc"],
+                                "commit": {
+                                    "sha": "def456789012",
+                                    "author": "Second Tester <second@example.invalid>",
+                                    "subject": "Merge old into next",
+                                },
+                                "via_commits": [
+                                    {
+                                        "sha": "fed987654321",
+                                        "author": "Via Tester <via@example.invalid>",
+                                        "subject": "break it again",
+                                    }
+                                ],
+                                "from_test_merge": False,
+                            },
+                            {
+                                "files": ["unmerged.txt"],
+                                "commit": None,
+                                "via_commits": [
+                                    {
+                                        "sha": f"{index:012d}",
+                                        "author": "Old Tester <old@example.invalid>",
+                                        "subject": f"old change {index}",
+                                    }
+                                    for index in range(7)
+                                ],
+                                "from_test_merge": True,
+                            },
+                        ],
                         "candidate_commits": [],
                     }
                 ],
@@ -499,16 +680,34 @@ class StateTests(unittest.TestCase):
             "[def456789012](https://github.example/owner/repo/commit/def456789012)",
             zulip_text,
         )
-        self.assertIn("*Conflicted files (1):*\n```\n- file.txt\n```", slack_text)
+        self.assertIn(
+            "*Conflicted files (1):*\n"
+            "*Started conflicting at:* <https://github.example/owner/repo/commit/abc|abc> - break it\n"
+            "*Author:* Tester <tester@example.invalid>\n"
+            "```\n- file.txt\n```",
+            slack_text,
+        )
         self.assertNotIn("*Candidate commits touching conflicted files:*", slack_text)
         self.assertNotIn("abc111222333", slack_text)
         self.assertNotIn("def111222333", slack_text)
         self.assertNotIn("abc111222333", zulip_text)
         self.assertNotIn("def111222333", zulip_text)
         self.assertIn(
-            "*Conflicted files (2):*\n```\n- other.txt\n- src/deep/path.cc\n```",
+            "*Conflicted files (3):*\n"
+            "*Started conflicting at:* "
+            "<https://github.example/owner/repo/commit/def456789012|def456789012> - Merge old into next\n"
+            "*Merged by:* Second Tester <second@example.invalid>\n"
+            "*Changes brought in that touch these files:*\n"
+            "- <https://github.example/owner/repo/commit/fed987654321|fed987654321> - break it again "
+            "(Via Tester <via@example.invalid>)\n"
+            "```\n- other.txt\n- src/deep/path.cc\n```\n"
+            "*Started conflicting at:* unmerged changes from earlier branches\n"
+            "*Changes brought in that touch these files:*\n",
             slack_text,
         )
+        self.assertIn("old change 4", slack_text)
+        self.assertNotIn("old change 5", slack_text)
+        self.assertIn("- and 2 more\n```\n- unmerged.txt\n```", slack_text)
         self.assertNotIn("Base branch:", slack_text)
         self.assertNotIn("Health fingerprint:", slack_text)
         self.assertNotIn("Chain fingerprint:", slack_text)
@@ -540,11 +739,18 @@ class StateTests(unittest.TestCase):
                         "status": "conflict",
                         "message": "blocked",
                         "conflicted_files": ["file.txt"],
-                        "first_conflicting_commit": {
-                            "sha": "abc123",
-                            "author": "Tester <tester@example.invalid>",
-                            "subject": "break it",
-                        },
+                        "conflict_origins": [
+                            {
+                                "files": ["file.txt"],
+                                "commit": {
+                                    "sha": "abc123",
+                                    "author": "Tester <tester@example.invalid>",
+                                    "subject": "break it",
+                                },
+                                "via_commits": [],
+                                "from_test_merge": False,
+                            }
+                        ],
                         "candidate_commits": [],
                     }
                 ],

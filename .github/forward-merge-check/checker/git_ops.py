@@ -112,11 +112,59 @@ def is_ancestor(repo: Path, maybe_ancestor: str, descendant: str) -> bool:
     return proc.returncode == 0
 
 
-def get_commit_info(repo: Path, sha: str) -> CommitInfo:
-    fmt = "%H%x00%an <%ae>%x00%s"
-    proc = git(repo, ["show", "-s", f"--format={fmt}", sha])
-    commit_sha, author, subject = proc.stdout.rstrip("\n").split("\x00", 2)
+COMMIT_INFO_FORMAT = "%H%x00%an <%ae>%x00%s"
+
+
+def parse_commit_info(line: str) -> CommitInfo:
+    commit_sha, author, subject = line.split("\x00", 2)
     return CommitInfo(sha=commit_sha, author=author, subject=subject)
+
+
+def get_commit_info(repo: Path, sha: str) -> CommitInfo:
+    proc = git(repo, ["show", "-s", f"--format={COMMIT_INFO_FORMAT}", sha])
+    return parse_commit_info(proc.stdout.rstrip("\n"))
+
+
+def is_merge_commit(repo: Path, sha: str) -> bool:
+    parents = git(repo, ["show", "-s", "--format=%P", sha]).stdout.split()
+    return len(parents) > 1
+
+
+def commits_brought_in_by_merge(repo: Path, merge_sha: str, paths: list[str]) -> list[CommitInfo]:
+    proc = git(
+        repo,
+        [
+            "log",
+            "--no-merges",
+            f"--format={COMMIT_INFO_FORMAT}",
+            f"{merge_sha}^1..{merge_sha}",
+            "--",
+            *paths,
+        ],
+    )
+    return [parse_commit_info(line) for line in proc.stdout.splitlines() if line]
+
+
+def merge_tree_conflicted_files(repo: Path, ours: str, theirs: str) -> list[str]:
+    """
+    Merge in memory with `git merge-tree --write-tree` (git 2.38+), without a
+    worktree or checkout, and return the conflicted paths.
+    """
+    proc = git(
+        repo,
+        ["merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", ours, theirs],
+        check=False,
+    )
+    # Exit code 0 is a clean merge and 1 is a merge with conflicts.
+    if proc.returncode not in (0, 1):
+        raise RuntimeError(
+            f"git merge-tree failed for {ours} and {theirs}\n"
+            f"exit code: {proc.returncode}\n"
+            f"stderr:\n{proc.stderr or ''}"
+        )
+
+    # The output is the merged tree id, then one entry per conflicted path.
+    return [path for path in proc.stdout.split("\0")[1:] if path]
 
 
 def branch_head(repo: Path, branch: str) -> str:

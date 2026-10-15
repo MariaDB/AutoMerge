@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from .git_ops import branch_head
-from .models import CommitInfo, ConflictCommit, MergeResult, NotificationReason
+from .models import CommitInfo, ConflictCommit, ConflictOrigin, MergeResult, NotificationReason
 
 
 def commit_to_dict(commit: Optional[CommitInfo]) -> Optional[dict]:
@@ -15,6 +15,15 @@ def commit_to_dict(commit: Optional[CommitInfo]) -> Optional[dict]:
         "sha": commit.sha,
         "author": commit.author,
         "subject": commit.subject,
+    }
+
+
+def conflict_origin_to_dict(origin: ConflictOrigin) -> dict:
+    return {
+        "files": origin.files,
+        "commit": commit_to_dict(origin.commit),
+        "via_commits": [commit_to_dict(commit) for commit in origin.via_commits],
+        "from_test_merge": origin.from_test_merge,
     }
 
 
@@ -35,7 +44,9 @@ def result_to_dict(result: MergeResult) -> dict:
         "status": result.status,
         "message": result.message,
         "conflicted_files": result.conflicted_files,
-        "first_conflicting_commit": commit_to_dict(result.first_conflicting_commit),
+        "conflict_origins": [
+            conflict_origin_to_dict(origin) for origin in result.conflict_origins
+        ],
         "candidate_commits": [
             conflict_commit_to_dict(commit) for commit in result.candidate_commits
         ],
@@ -63,9 +74,18 @@ def current_state(repo: Path, branches: list[str], base_branch: str, results: li
         "status": status,
         "blocked_edge": None if blocked is None else [blocked.source_label, blocked.target],
         "conflicted_files": [] if blocked is None else blocked.conflicted_files,
-        "first_conflicting_commit": None
-        if blocked is None or blocked.first_conflicting_commit is None
-        else blocked.first_conflicting_commit.sha,
+        # Via commits are left out: for a test merge they grow with every new
+        # commit on the earlier branches, which is not a health change.
+        "conflict_origins": []
+        if blocked is None
+        else [
+            {
+                "files": origin.files,
+                "commit": None if origin.commit is None else origin.commit.sha,
+                "from_test_merge": origin.from_test_merge,
+            }
+            for origin in blocked.conflict_origins
+        ],
         "results": [
             {
                 "target": result.target,
@@ -147,12 +167,20 @@ def compact_state(state: dict) -> dict:
                 "target": result["target"],
                 "status": result["status"],
                 "conflicted_files": result["conflicted_files"],
-                "first_conflicting_commit": None
-                if result["first_conflicting_commit"] is None
-                else {
-                    "sha": result["first_conflicting_commit"]["sha"],
-                    "subject": result["first_conflicting_commit"]["subject"],
-                },
+                "conflict_origins": [
+                    {
+                        "files": origin["files"],
+                        "commit": None
+                        if origin["commit"] is None
+                        else {
+                            "sha": origin["commit"]["sha"],
+                            "subject": origin["commit"]["subject"],
+                        },
+                        "via_commits": [commit["sha"] for commit in origin["via_commits"]],
+                        "from_test_merge": origin["from_test_merge"],
+                    }
+                    for origin in result["conflict_origins"]
+                ],
             }
             for result in state["results"]
         ],

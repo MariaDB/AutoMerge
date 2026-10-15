@@ -3,24 +3,35 @@ from typing import Optional
 
 from .git_ops import (
     add_worktree,
+    commits_brought_in_by_merge,
     ensure_ref,
     get_commit_info,
     get_conflicted_files,
     git,
     is_ancestor,
+    is_merge_commit,
+    merge_tree_conflicted_files,
     remove_worktree,
     require_branch_ref,
 )
-from .models import CommitInfo, ConflictCommit, MergeResult
+from .models import ConflictCommit, ConflictOrigin, MergeResult
 
 
 def source_commits(repo: Path, target_ref: str, source_ref: str) -> list[str]:
+    """
+    Commits on the source's own first-parent line that the target does not
+    have yet, newest first.
+
+    Merge commits stay in the walk because "Merge 10.11 into 11.4" is a step on
+    11.4's line. Commits that only arrived through such a merge are left out:
+    merging one of them on its own into the target uses a different merge base
+    and skips the merge that may already have adapted it.
+    """
     proc = git(
         repo,
         [
             "rev-list",
-            "--reverse",
-            "--no-merges",
+            "--first-parent",
             f"{target_ref}..{source_ref}",
         ],
     )
@@ -118,33 +129,82 @@ def try_merge(
         remove_worktree(repo, worktree)
 
 
-def find_first_conflicting_commit(
+def conflict_start_commits(
     repo: Path,
+    target_ref: str,
+    commits: list[str],
+    conflicted_files: list[str],
+) -> dict[str, Optional[str]]:
+    """
+    Map each conflicted file to the source-side commit where it last went from
+    merging cleanly to conflicting.
+
+    Walks the source commits from the tip back towards the target, merging each
+    one into the target in memory, and stops once every file has merged
+    cleanly at some point. A file that conflicts at every commit started at the
+    oldest one, whose parent the target already has. A file that does not
+    conflict at the tip maps to None.
+    """
+    started_at: dict[str, Optional[str]] = {}
+    pending = set(conflicted_files)
+    newer: Optional[str] = None
+
+    for sha in commits:
+        if not pending:
+            break
+
+        conflicted = set(merge_tree_conflicted_files(repo, target_ref, sha))
+        for path in pending - conflicted:
+            started_at[path] = newer
+        pending &= conflicted
+        newer = sha
+
+    for path in pending:
+        started_at[path] = newer
+
+    return started_at
+
+
+def find_conflict_origins(
+    repo: Path,
+    target_ref: str,
     source_ref: str,
-    target: str,
-    scratch_root: Path,
-) -> Optional[CommitInfo]:
-    """
-    Approximation.
+    conflicted_files: list[str],
+    source_is_test_merge: bool = False,
+) -> list[ConflictOrigin]:
+    commits = source_commits(repo, target_ref, source_ref)
+    started_at = conflict_start_commits(repo, target_ref, commits, conflicted_files)
+    origins: list[ConflictOrigin] = []
 
-    Each source-side non-merge commit is tried independently against the target.
-    Git conflicts are produced by both branches together, so this is not a
-    perfect root cause. It is a practical answer to "which source-side commit
-    should I inspect first?" for scheduled chain-health runs too, not only PRs.
-    """
-    target_ref = require_branch_ref(repo, target)
+    # Oldest commit first, then any files that could not be attributed.
+    for sha in [*reversed(commits), None]:
+        files = [path for path in conflicted_files if started_at.get(path) == sha]
+        if not files:
+            continue
 
-    for sha in source_commits(repo, target_ref, source_ref):
-        ok, _files, _merge_sha, _candidates = try_merge(
-            repo,
-            target_ref,
-            sha,
-            scratch_root,
+        if sha is None:
+            origins.append(ConflictOrigin(files=files))
+            continue
+
+        via_commits = (
+            commits_brought_in_by_merge(repo, sha, files)
+            if is_merge_commit(repo, sha)
+            else []
         )
-        if not ok:
-            return get_commit_info(repo, sha)
+        if source_is_test_merge and sha == commits[0]:
+            origins.append(
+                ConflictOrigin(files=files, via_commits=via_commits, from_test_merge=True)
+            )
+        else:
+            origins.append(
+                ConflictOrigin(
+                    files=files,
+                    commit=get_commit_info(repo, sha),
+                    via_commits=via_commits,
+                )
+            )
 
-    return None
+    return origins
 
 
 def check_merge(
@@ -153,6 +213,7 @@ def check_merge(
     source_ref: str,
     target: str,
     scratch_root: Path,
+    source_is_test_merge: bool = False,
 ) -> MergeResult:
     target_ref = require_branch_ref(repo, target)
     ensure_ref(repo, target_ref)
@@ -185,11 +246,12 @@ def check_merge(
             message=f"{source_label} merges cleanly into {target}.",
         )
 
-    first_conflicting_commit = find_first_conflicting_commit(
+    conflict_origins = find_conflict_origins(
         repo=repo,
+        target_ref=target_ref,
         source_ref=source_ref,
-        target=target,
-        scratch_root=scratch_root,
+        conflicted_files=conflicted_files,
+        source_is_test_merge=source_is_test_merge,
     )
     return MergeResult(
         source_label=source_label,
@@ -198,7 +260,7 @@ def check_merge(
         status="conflict",
         message=f"{source_label} cannot be cleanly merged into {target}.",
         conflicted_files=conflicted_files,
-        first_conflicting_commit=first_conflicting_commit,
+        conflict_origins=conflict_origins,
         candidate_commits=candidates,
     )
 
