@@ -9,7 +9,7 @@ branches:
   - "11.4"
   - "11.8"
   - "12.3"
-  - "13.1"
+  - "13.2"
   - "main"
 
 notifications:
